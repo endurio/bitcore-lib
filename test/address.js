@@ -68,11 +68,11 @@ describe('Address', function() {
 
   // livenet valid
   var PKHLivenet = [
-    '15vkcKf7gB23wLAnZLmbVuMiiVDc1Nm4a2',
-    '1A6ut1tWnUq1SEQLMr4ttDh24wcbJ5o9TT',
-    '1BpbpfLdY7oBS9gK7aDXgvMgr1DPvNhEB2',
-    '1Jz2yCRd5ST1p2gUqFB5wsSQfdm3jaFfg7',
-    '    1Jz2yCRd5ST1p2gUqFB5wsSQfdm3jaFfg7   \t\n'
+    'AUJdJ8LHezEDahMTQoZ8uSWf489mGtwgGA',
+    'APeVNJN1fz4b3iQRWybBbL8jmD7Gyr85ij',
+    'AHfVAd37c36La5xtBJsScDLGLdZsaDh56Y',
+    'AMfmYNz5j17avF28bdTaKH7THp8z2f3Bah',
+    '    AYRPNMdP17efE9exJzh8jV3HtW6JJhgXL8   \t\n'
   ];
 
   // livenet p2sh
