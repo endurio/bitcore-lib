@@ -34581,6 +34581,7 @@ function Output(args) {
   }
   if (_.isObject(args)) {
     this.satoshis = args.satoshis;
+    this.token = args.token;
     if (bufferUtil.isBuffer(args.script)) {
       this._scriptBuffer = args.script;
     } else {
@@ -34596,6 +34597,20 @@ function Output(args) {
     throw new TypeError('Unrecognized argument for Output');
   }
 }
+
+Object.defineProperty(Output.prototype, 'token', {
+  configurable: false,
+  enumerable: true,
+  get: function() {
+    return this._token;
+  },
+  set: function(value) {
+    if (value !== 'NDR') {
+      this._token = 'STB';
+    }
+    return this._token = value;
+  },
+});
 
 Object.defineProperty(Output.prototype, 'script', {
   configurable: false,
@@ -34654,6 +34669,7 @@ Output.prototype.invalidSatoshis = function() {
 
 Output.prototype.toObject = Output.prototype.toJSON = function toObject() {
   var obj = {
+    toekn: this.token,
     satoshis: this.satoshis
   };
   obj.script = this._scriptBuffer.toString('hex');
@@ -34702,16 +34718,19 @@ Output.prototype.inspect = function() {
   } else {
     scriptStr = this._scriptBuffer.toString('hex');
   }
-  return '<Output (' + this.satoshis + ' sats) ' + scriptStr + '>';
+  return '<Output (' + this.satoshis + ' u' + this.token + ') ' + scriptStr + '>';
 };
 
 Output.fromBufferReader = function(br) {
-  var obj = {};
+  var obj = {
+    token: 'STB',
+  };
   obj.satoshis = br.readUInt64LEBN();
   var size = br.readVarintNum();
   if (size !== 0) {
     obj.script = br.read(size);
     if (obj.script[0] === Opcode.OP_NDR) {
+      obj.token = 'NDR';
       obj.script = script.slice(1);
     }
   } else {
@@ -34726,8 +34745,13 @@ Output.prototype.toBufferWriter = function(writer) {
   }
   writer.writeUInt64LEBN(this._satoshisBN);
   var script = this._scriptBuffer;
-  writer.writeVarintNum(script.length+1);
-  writer.writeUInt8(Opcode.OP_NDR);
+  if (this.token === 'NDR') {
+    // TODO: check script length limit
+    writer.writeVarintNum(script.length+1);
+    writer.writeUInt8(Opcode.OP_NDR);
+  } else {
+    writer.writeVarintNum(script.length);
+  }
   writer.write(script);
   return writer;
 };
@@ -35163,8 +35187,7 @@ function Transaction(serialized) {
   }
   this.inputs = [];
   this.outputs = [];
-  this._inputAmount = undefined;
-  this._outputAmount = undefined;
+  this._changeIndex = {};
 
   if (serialized) {
     if (serialized instanceof Transaction) {
@@ -35187,7 +35210,7 @@ var DEFAULT_NLOCKTIME = 0;
 var MAX_BLOCK_SIZE = 1000000;
 
 // Minimum amount for an output for it not to be considered a dust output
-Transaction.DUST_AMOUNT = 546;
+Transaction.DUST_AMOUNT = {'STB': 0, 'NDR': 0};
 
 // Margin of error to allow fees in the vecinity of the expected value but doesn't allow a big difference
 Transaction.FEE_SECURITY_MARGIN = 150;
@@ -35202,7 +35225,7 @@ Transaction.NLOCKTIME_BLOCKHEIGHT_LIMIT = 5e8;
 Transaction.NLOCKTIME_MAX_VALUE = 4294967295;
 
 // Value used for fee estimation (satoshis per kilobyte)
-Transaction.FEE_PER_KB = 100000;
+Transaction.FEE_PER_KB = {'STB': 0, 'NDR': 0};
 
 // Safe upper bound for change address script size in bytes
 Transaction.CHANGE_OUTPUT_MAX_SIZE = 20 + 4 + 34 + 4;
@@ -35341,12 +35364,14 @@ Transaction.prototype.getSerializationError = function(opts) {
 
   var unspent = this._getUnspentValue();
   var unspentError;
-  if (unspent < 0) {
-    if (!opts.disableMoreOutputThanInput) {
-      unspentError = new errors.Transaction.InvalidOutputAmountSum();
+  for (let token in unspent) {
+    if (unspent[token] < 0) {
+      if (!opts.disableMoreOutputThanInput) {
+        unspentError = new errors.Transaction.InvalidOutputAmountSum();
+      }
+    } else {
+      unspentError = this._hasFeeError(opts, unspent[token]);
     }
-  } else {
-    unspentError = this._hasFeeError(opts, unspent);
   }
 
   return unspentError ||
@@ -35355,39 +35380,45 @@ Transaction.prototype.getSerializationError = function(opts) {
 };
 
 Transaction.prototype._hasFeeError = function(opts, unspent) {
-
-  if (!_.isUndefined(this._fee) && this._fee !== unspent) {
-    return new errors.Transaction.FeeError.Different(
-      'Unspent value is ' + unspent + ' but specified fee is ' + this._fee
-    );
+  for (let token in unspent) {
+    if (!_.isUndefined(this._fee[token]) && this._fee[token] !== unspent[token]) {
+      return new errors.Transaction.FeeError.Different(
+        'Unspent value of ' + token + ' is ' + unspent + ' but specified fee is ' + this._fee[token]
+      );
+    }
   }
 
   if (!opts.disableLargeFees) {
-    var maximumFee = Math.floor(Transaction.FEE_SECURITY_MARGIN * this._estimateFee());
-    if (unspent > maximumFee) {
-      if (this._missingChange()) {
-        return new errors.Transaction.ChangeAddressMissing(
-          'Fee is too large and no change address was provided'
+    let estimateFee = this._estimateFee();
+    for (let token in unspent) {
+      var maximumFee = Math.floor(Transaction.FEE_SECURITY_MARGIN * estimateFee[token]);
+      if (unspent[token] > maximumFee) {
+        if (this._missingChange(token)) {
+          return new errors.Transaction.ChangeAddressMissing(
+            'Fee is too large and no change address was provided for ' + token
+          );
+        }
+        return new errors.Transaction.FeeError.TooLarge(
+          'expected less than ' + maximumFee + ' but got ' + unspent
         );
       }
-      return new errors.Transaction.FeeError.TooLarge(
-        'expected less than ' + maximumFee + ' but got ' + unspent
-      );
     }
   }
 
   if (!opts.disableSmallFees) {
-    var minimumFee = Math.ceil(this._estimateFee() / Transaction.FEE_SECURITY_MARGIN);
-    if (unspent < minimumFee) {
-      return new errors.Transaction.FeeError.TooSmall(
-        'expected more than ' + minimumFee + ' but got ' + unspent
-      );
+    for (let token in unspent) {
+      let minimumFee = Math.ceil(estimateFee[token] / Transaction.FEE_SECURITY_MARGIN);
+      if (unspent[token] < minimumFee) {
+        return new errors.Transaction.FeeError.TooSmall(
+          'expected more than ' + minimumFee + ' but got ' + unspent + ' of ' + token
+        );
+      }
     }
   }
 };
 
-Transaction.prototype._missingChange = function() {
-  return !this._changeScript;
+Transaction.prototype._missingChange = function(token) {
+  return _.isUndefined(this._changeScript) || !this._changeScript[token];
 };
 
 Transaction.prototype._hasDustOutputs = function(opts) {
@@ -35397,7 +35428,10 @@ Transaction.prototype._hasDustOutputs = function(opts) {
   var index, output;
   for (index in this.outputs) {
     output = this.outputs[index];
-    if (output.satoshis < Transaction.DUST_AMOUNT && !output.script.isDataOut()) {
+    if (!Transaction.DUST_AMOUNT.hasOwnProperty(output.token)) {
+      continue;
+    }
+    if (output.satoshis < Transaction.DUST_AMOUNT[output.token] && !output.script.isDataOut()) {
       return new errors.Transaction.DustOutputs();
     }
   }
@@ -35529,13 +35563,16 @@ Transaction.prototype.toObject = Transaction.prototype.toJSON = function toObjec
     nLockTime: this.nLockTime
   };
   if (this._changeScript) {
-    obj.changeScript = this._changeScript.toString();
+    obj.changeScript = {};
+    for (let token in this._changeScript) {
+      obj.changeScript[token] = this._changeScript[token].toString();
+    }
   }
-  if (!_.isUndefined(this._changeIndex)) {
-    obj.changeIndex = this._changeIndex;
+  if (this._changeIndex) {
+    obj.changeIndex = Object.assign({}, this._changeIndex);
   }
-  if (!_.isUndefined(this._fee)) {
-    obj.fee = this._fee;
+  if (this._fee) {
+    obj.fee = Object.assign({}, this._fee);
   }
   return obj;
 };
@@ -35574,13 +35611,16 @@ Transaction.prototype.fromObject = function fromObject(arg) {
     self.addOutput(new Output(output));
   });
   if (transaction.changeIndex) {
-    this._changeIndex = transaction.changeIndex;
+    this._changeIndex = Object.assign({}, transaction.changeIndex);
   }
   if (transaction.changeScript) {
-    this._changeScript = new Script(transaction.changeScript);
+    this._changeScript = {};
+    for (let token in transaction.changeScript) {
+      this._changeScript[token] = new Script(transaction.changeScript[token]);
+    }
   }
   if (transaction.fee) {
-    this._fee = transaction.fee;
+    this._fee = Object.assign({}, transaction.fee);
   }
   this.nLockTime = transaction.nLockTime;
   this.version = transaction.version;
@@ -35589,11 +35629,13 @@ Transaction.prototype.fromObject = function fromObject(arg) {
 };
 
 Transaction.prototype._checkConsistency = function(arg) {
-  if (!_.isUndefined(this._changeIndex)) {
-    $.checkState(this._changeScript, 'Change script is expected.');
-    $.checkState(this.outputs[this._changeIndex], 'Change index points to undefined output.');
-    $.checkState(this.outputs[this._changeIndex].script.toString() ===
-      this._changeScript.toString(), 'Change output has an unexpected script.');
+  if (this._changeIndex) {
+    for (let token in this._changeIndex) {
+      $.checkState(this._changeScript[token], 'Change script is expected.');
+      $.checkState(this.outputs[this._changeIndex[token]], 'Change index points to undefined output.');
+      $.checkState(this.outputs[this._changeIndex[token]].script.toString() ===
+        this._changeScript[token].toString(), 'Change output has an unexpected script.');
+    }
   }
   if (arg && arg.hash) {
     $.checkState(arg.hash === this.hash, 'Hash in object does not match transaction hash.');
@@ -35770,6 +35812,7 @@ Transaction.prototype._fromNonP2SH = function(utxo) {
   this.addInput(new clazz({
     output: new Output({
       script: utxo.script,
+      token: utxo.token,
       satoshis: utxo.satoshis
     }),
     prevTxId: utxo.txId,
@@ -35793,12 +35836,13 @@ Transaction.prototype._fromMultisigUtxo = function(utxo, pubkeys, threshold, nes
   this.addInput(new clazz({
     output: new Output({
       script: utxo.script,
+      token: utxo.token,
       satoshis: utxo.satoshis
     }),
     prevTxId: utxo.txId,
     outputIndex: utxo.outputIndex,
     script: Script.empty()
-  }, pubkeys, threshold, false, nestedWitness, opts));
+  }, pubkeys, threshfold, false, nestedWitness, opts));
 };
 
 /**
@@ -35809,18 +35853,25 @@ Transaction.prototype._fromMultisigUtxo = function(utxo, pubkeys, threshold, nes
  * @param {Input} input
  * @param {String|Script} outputScript
  * @param {number} satoshis
+ * @param {string} token
  * @return Transaction this, for chaining
  */
-Transaction.prototype.addInput = function(input, outputScript, satoshis) {
+Transaction.prototype.addInput = function(input, outputScript, satoshis, token) {
   $.checkArgumentType(input, Input, 'input');
   if (!input.output && (_.isUndefined(outputScript) || _.isUndefined(satoshis))) {
     throw new errors.Transaction.NeedMoreInfo('Need information about the UTXO script and satoshis');
   }
   if (!input.output && outputScript && !_.isUndefined(satoshis)) {
+    if (_.isUndefined(token)) {
+      token = 'STB';
+    } else if (token !== 'STB' && token !== 'NDR') {
+      throw new errors.InvalidArgument('Token must be either STB or NDR');
+    }
     outputScript = outputScript instanceof Script ? outputScript : new Script(outputScript);
     $.checkArgumentType(satoshis, 'number', 'satoshis');
     input.output = new Output({
       script: outputScript,
+      token: token,
       satoshis: satoshis
     });
   }
@@ -35837,8 +35888,10 @@ Transaction.prototype.addInput = function(input, outputScript, satoshis) {
 Transaction.prototype.uncheckedAddInput = function(input) {
   $.checkArgumentType(input, Input, 'input');
   this.inputs.push(input);
-  this._inputAmount = undefined;
-  this._updateChangeOutput();
+  if (!_.isUndefined(this._inputAmount)) {
+    delete(this._inputAmount[input.output.token]);
+  }
+  this._updateChangeOutput(input.output.token);
   return this;
 };
 
@@ -35858,11 +35911,14 @@ Transaction.prototype.hasAllUtxoInfo = function() {
  * for inputs (in further versions, SIGHASH_SINGLE or SIGHASH_NONE signatures will not
  * be reset).
  *
- * @param {number} amount satoshis to be sent
+ * @param {Object} amount satoshis to be sent for each token
  * @return {Transaction} this, for chaining
  */
 Transaction.prototype.fee = function(amount) {
-  $.checkArgument(_.isNumber(amount), 'amount must be a number');
+  $.checkArgument(_.isObject(amount), 'amount must be a map of string:number');
+  for (let token in amount) {
+    $.checkArgument(_.isNumber(amount[token]), 'amount of ' + token + ' must be a number');
+  }
   this._fee = amount;
   this._updateChangeOutput();
   return this;
@@ -35873,11 +35929,14 @@ Transaction.prototype.fee = function(amount) {
  * for inputs (in further versions, SIGHASH_SINGLE or SIGHASH_NONE signatures will not
  * be reset).
  *
- * @param {number} amount satoshis per KB to be sent
+ * @param {Object} amount satoshis per KB to be sent for each token
  * @return {Transaction} this, for chaining
  */
 Transaction.prototype.feePerKb = function(amount) {
-  $.checkArgument(_.isNumber(amount), 'amount must be a number');
+  $.checkArgument(_.isObject(amount), 'amount must be a map of string:number');
+  for (let token in amount) {
+    $.checkArgument(_.isNumber(amount[token]), 'amount of ' + token + ' must be a number');
+  }
   this._feePerKb = amount;
   this._updateChangeOutput();
   return this;
@@ -35891,12 +35950,17 @@ Transaction.prototype.feePerKb = function(amount) {
  * Beware that this resets all the signatures for inputs (in further versions,
  * SIGHASH_SINGLE or SIGHASH_NONE signatures will not be reset).
  *
- * @param {Address} address An address for change to be sent to.
+ * @param {Object} address Addresses for change of each token to be sent to.
  * @return {Transaction} this, for chaining
  */
 Transaction.prototype.change = function(address) {
-  $.checkArgument(address, 'address is required');
-  this._changeScript = Script.fromAddress(address);
+  $.checkArgument(_.isObject(address), 'address must be a map of string:Address');
+  let changeScript = {};
+  for (let token in address) {
+    $.checkArgument(address[token], 'address of ' + token + ' is required');
+    changeScript[token] = Script.fromAddress(address[token]);
+  }
+  this._changeScript = changeScript;
   this._updateChangeOutput();
   return this;
 };
@@ -35916,6 +35980,7 @@ Transaction.prototype.getChangeOutput = function() {
  * @typedef {Object} Transaction~toObject
  * @property {(string|Address)} address
  * @property {number} satoshis
+ * @property {string} token
  */
 
 /**
@@ -35926,13 +35991,18 @@ Transaction.prototype.getChangeOutput = function() {
  *
  * @param {(string|Address|Array.<Transaction~toObject>)} address
  * @param {number} amount in satoshis
+ * @param {string} token of the output
  * @return {Transaction} this, for chaining
  */
-Transaction.prototype.to = function(address, amount) {
+Transaction.prototype.to = function(address, amount, token) {
+  if (_.isUndefined(token)) {
+    token = 'STB';
+  }
+
   if (_.isArray(address)) {
     var self = this;
     _.each(address, function(to) {
-      self.to(to.address, to.satoshis);
+      self.to(to.address, to.satoshis, token);
     });
     return this;
   }
@@ -35943,7 +36013,8 @@ Transaction.prototype.to = function(address, amount) {
   );
   this.addOutput(new Output({
     script: Script(new Address(address)),
-    satoshis: amount
+    satoshis: amount,
+    token: token,
   }));
   return this;
 };
@@ -35976,7 +36047,7 @@ Transaction.prototype.addData = function(value) {
 Transaction.prototype.addOutput = function(output) {
   $.checkArgumentType(output, Output, 'output');
   this._addOutput(output);
-  this._updateChangeOutput();
+  this._updateChangeOutput(output.token);
   return this;
 };
 
@@ -35990,7 +36061,7 @@ Transaction.prototype.clearOutputs = function() {
   this.outputs = [];
   this._clearSignatures();
   this._outputAmount = undefined;
-  this._changeIndex = undefined;
+  this._changeIndex = {};
   this._updateChangeOutput();
   return this;
 };
@@ -36004,16 +36075,30 @@ Transaction.prototype._addOutput = function(output) {
 
 /**
  * Calculates or gets the total output amount in satoshis
- *
+ * 
  * @return {Number} the transaction total output amount
  */
 Transaction.prototype._getOutputAmount = function() {
-  if (_.isUndefined(this._outputAmount)) {
-    var self = this;
-    this._outputAmount = 0;
-    _.each(this.outputs, function(output) {
-      self._outputAmount += output.satoshis;
-    });
+  if (!_.isUndefined(this._outputAmount)) {
+    for (let token in this._outputAmount) {
+      if (_.isUndefined(this._outputAmount[token])) {
+        // one of the amount is undefined, recalculate the whole map
+        break;
+      }
+    }
+    // all good, return the cached map
+    return this._outputAmount;  
+  }
+
+  this._outputAmount = {};
+  for (let i in this.outputs) {
+    let output = this.outputs[i];
+    let token = output.token;
+    if (!this._outputAmount.hasOwnProperty(token)) {
+      this._outputAmount[token] = output.satoshis;
+    } else {
+      this._outputAmount[token] += output.satoshis;
+    }
   }
   return this._outputAmount;
 };
@@ -36022,39 +36107,72 @@ Transaction.prototype._getOutputAmount = function() {
 /**
  * Calculates or gets the total input amount in satoshis
  *
- * @return {Number} the transaction total input amount
+ * @return {Object} the map transaction total input amount for each token.
  */
 Transaction.prototype._getInputAmount = function() {
-  if (_.isUndefined(this._inputAmount)) {
-    this._inputAmount = _.sumBy(this.inputs, function(input) {
-      if (_.isUndefined(input.output)) {
-        throw new errors.Transaction.Input.MissingPreviousOutput();
+  if (!_.isUndefined(this._inputAmount)) {
+    for (let token in this._inputAmount) {
+      if (_.isUndefined(this._inputAmount[token])) {
+        // one of the amount is undefined, recalculate the whole map
+        break;
       }
-      return input.output.satoshis;
-    });
+    }
+    // all good, return the cached map
+    return this._inputAmount;  
+  }
+
+  this._inputAmount = {};
+  for (let i in this.inputs) {
+    let input = this.inputs[i];
+    if (_.isUndefined(input.output)) {
+      throw new errors.Transaction.Input.MissingPreviousOutput();
+    }
+    let token = input.output.token;
+    if (!this._inputAmount.hasOwnProperty(token)) {
+      this._inputAmount[token] = input.output.satoshis;
+    } else {
+      this._inputAmount[token] += input.output.satoshis;
+    }
   }
   return this._inputAmount;
 };
 
-Transaction.prototype._updateChangeOutput = function() {
-  if (!this._changeScript) {
+Transaction.prototype._updateChangeOutput = function(token) {
+  if (_.isUndefined(this._changeScript) || Object.keys(this._changeScript).length == 0) {
     return;
   }
+
   this._clearSignatures();
-  if (!_.isUndefined(this._changeIndex)) {
-    this._removeOutput(this._changeIndex);
+
+  for (let t in this._changeScript) {
+    if (!_.isUndefined(token) && t !== token ) {
+      // token is defined and different with tkn param
+      continue;
+    }
+    if (!_.isUndefined(this._changeIndex[t])) {
+      this._removeOutput(this._changeIndex[t]);
+    }
   }
+
   var available = this._getUnspentValue();
   var fee = this.getFee();
-  var changeAmount = available - fee;
-  if (changeAmount > 0) {
-    this._changeIndex = this.outputs.length;
-    this._addOutput(new Output({
-      script: this._changeScript,
-      satoshis: changeAmount
-    }));
-  } else {
-    this._changeIndex = undefined;
+
+  for (let t in this._changeScript) {
+    if (!_.isUndefined(token) && t !== token ) {
+      // token is defined and different with tkn param
+      continue;
+    }
+    let changeAmount = available[t] - fee[t];
+    if (changeAmount > 0) {
+      this._changeIndex[t] = this.outputs.length;
+      this._addOutput(new Output({
+        script: this._changeScript[t],
+        token: t,
+        satoshis: changeAmount,
+      }));
+    } else {
+      delete(this._changeIndex[t]);
+    }
   }
 };
 /**
@@ -36099,7 +36217,24 @@ Transaction.prototype._estimateFee = function() {
 };
 
 Transaction.prototype._getUnspentValue = function() {
-  return this._getInputAmount() - this._getOutputAmount();
+  var inputAmount = this._getInputAmount();
+  var outputAmount = this._getOutputAmount();
+  var unspentValue = {};
+  for (let token in inputAmount) {
+    if (unspentValue.hasOwnProperty(token)) {
+      unspentValue[token] += inputAmount[token];
+    } else {
+      unspentValue[token] = inputAmount[token];
+    }
+  }
+  for (let token in outputAmount) {
+    if (unspentValue.hasOwnProperty(token)) {
+      unspentValue[token] -= outputAmount[token];
+    } else {
+      unspentValue[token] = -outputAmount[token];
+    }
+  }
+  return unspentValue;
 };
 
 Transaction.prototype._clearSignatures = function() {
@@ -36109,11 +36244,28 @@ Transaction.prototype._clearSignatures = function() {
 };
 
 Transaction._estimateFee = function(size, amountAvailable, feePerKb) {
-  var fee = Math.ceil(size / 1000) * (feePerKb || Transaction.FEE_PER_KB);
-  if (amountAvailable > fee) {
-    size += Transaction.CHANGE_OUTPUT_MAX_SIZE;
+  var fpkb = {}
+  for (let token in amountAvailable) {
+    if (_.isUndefined(Transaction.FEE_PER_KB[token]) ||
+        _.isUndefined(feePerKb) ||
+        !feePerKb.hasOwnProperty(token)) {
+      fpkb[token] = 0;
+    } else {
+      fpkb[token] = feePerKb[token] || Transaction.FEE_PER_KB[token];
+    }
+    let fee = Math.ceil(size / 1000) * fpkb[token];
+    if (amountAvailable[token] > fee) {
+      // increase size for each token change
+      size += Transaction.CHANGE_OUTPUT_MAX_SIZE;
+    }
   }
-  return Math.ceil(size / 1000) * (feePerKb || Transaction.FEE_PER_KB);
+
+  var estimateFee = {}
+  for (let token in amountAvailable) {
+    // recalculate for final size
+    estimateFee[token] = Math.ceil(size / 1000) * fpkb[token];
+  }
+  return estimateFee;
 };
 
 Transaction.prototype._estimateSize = function() {
@@ -36123,6 +36275,9 @@ Transaction.prototype._estimateSize = function() {
   });
   _.each(this.outputs, function(output) {
     result += output.script.toBuffer().length + 9;
+    if (output.token === 'NDR') {
+      result++;
+    }
   });
   return result;
 };
@@ -36131,11 +36286,12 @@ Transaction.prototype._removeOutput = function(index) {
   var output = this.outputs[index];
   this.outputs = _.without(this.outputs, output);
   this._outputAmount = undefined;
+  return output;
 };
 
 Transaction.prototype.removeOutput = function(index) {
-  this._removeOutput(index);
-  this._updateChangeOutput();
+  var removedOutput = this._removeOutput(index);
+  this._updateChangeOutput(removedOutput.token);
 };
 
 /**
@@ -36148,7 +36304,8 @@ Transaction.prototype.sort = function() {
   this.sortInputs(function(inputs) {
     var copy = Array.prototype.concat.apply([], inputs);
     copy.sort(function(first, second) {
-      return compare(first.prevTxId, second.prevTxId)
+      return compare(first.output.token, second.output.token)
+        || compare(first.prevTxId, second.prevTxId)
         || first.outputIndex - second.outputIndex;
     });
     return copy;
@@ -36156,7 +36313,8 @@ Transaction.prototype.sort = function() {
   this.sortOutputs(function(outputs) {
     var copy = Array.prototype.concat.apply([], outputs);
     copy.sort(function(first, second) {
-      return first.satoshis - second.satoshis
+      return compare(first.token, second.token)
+        || first.satoshis - second.satoshis
         || compare(first.script.toBuffer(), second.script.toBuffer());
     });
     return copy;
@@ -36209,9 +36367,11 @@ Transaction.prototype._newOutputOrder = function(newOutputs) {
     throw new errors.Transaction.InvalidSorting();
   }
 
-  if (!_.isUndefined(this._changeIndex)) {
-    var changeOutput = this.outputs[this._changeIndex];
-    this._changeIndex = _.findIndex(newOutputs, changeOutput);
+  for (let token in this._changeIndex) {
+    if (!_.isUndefined(this._changeIndex[token])) {
+      let changeOutput = this.outputs[this._changeIndex[token]];
+      this._changeIndex[token] = _.findIndex(newOutputs, changeOutput);
+    }
   }
 
   this.outputs = newOutputs;
@@ -36232,8 +36392,8 @@ Transaction.prototype.removeInput = function(txId, outputIndex) {
   }
   var input = this.inputs[index];
   this.inputs = _.without(this.inputs, input);
-  this._inputAmount = undefined;
-  this._updateChangeOutput();
+  delete(this._inputAmount[input.output.token]);
+  this._updateChangeOutput(input.output.token);
 };
 
 /* Signature handling */
@@ -36369,9 +36529,10 @@ Transaction.prototype.verify = function() {
   }
 
   // Check for negative or overflow output values
-  var valueoutbn = new BN(0);
+  var valueoutbn = {'STB': new BN(0), 'NDR': new BN(0)};
   for (var i = 0; i < this.outputs.length; i++) {
     var txout = this.outputs[i];
+    var token = txout.token;
 
     if (txout.invalidSatoshis()) {
       return 'transaction txout ' + i + ' satoshis is invalid';
@@ -36379,9 +36540,9 @@ Transaction.prototype.verify = function() {
     if (txout._satoshisBN.gt(new BN(Transaction.MAX_MONEY, 10))) {
       return 'transaction txout ' + i + ' greater than MAX_MONEY';
     }
-    valueoutbn = valueoutbn.add(txout._satoshisBN);
-    if (valueoutbn.gt(new BN(Transaction.MAX_MONEY))) {
-      return 'transaction txout ' + i + ' total output greater than MAX_MONEY';
+    valueoutbn[token] = valueoutbn[token].add(txout._satoshisBN);
+    if (valueoutbn[token].gt(new BN(Transaction.MAX_MONEY))) {
+      return 'transaction txout ' + i + ' total output of ' + token + ' greater than MAX_MONEY';
     }
   }
 
@@ -36479,6 +36640,7 @@ var Unit = require('../unit');
  * @param {string=} data.txId alias for `txid`
  * @param {number} data.vout the index in the transaction
  * @param {number=} data.outputIndex alias for `vout`
+ * @param {string=} data.token the ouptut's token, accepts 'NDR' and 'STB'
  * @param {string|Script} data.scriptPubKey the script that must be resolved to release the funds
  * @param {string|Script=} data.script alias for `scriptPubKey`
  * @param {number} data.amount amount of bitcoins associated
@@ -36502,6 +36664,8 @@ function UnspentOutput(data) {
   if (!_.isNumber(outputIndex)) {
     throw new Error('Invalid outputIndex, received ' + outputIndex);
   }
+  var token = _.isUndefined(data.token) ? 'STB' : data.token;
+  $.checkArgument(token === 'STB' || token === 'NDR', 'Token not supported');
   $.checkArgument(!_.isUndefined(data.scriptPubKey) || !_.isUndefined(data.script),
                   'Must provide the scriptPubKey for that output!');
   var script = new Script(data.scriptPubKey || data.script);
@@ -36513,6 +36677,7 @@ function UnspentOutput(data) {
     address: address,
     txId: txId,
     outputIndex: outputIndex,
+    token: token,
     script: script,
     satoshis: amount
   });
@@ -36524,6 +36689,7 @@ function UnspentOutput(data) {
  */
 UnspentOutput.prototype.inspect = function() {
   return '<UnspentOutput: ' + this.txId + ':' + this.outputIndex +
+         ', token: ' + this.token +
          ', satoshis: ' + this.satoshis + ', address: ' + this.address + '>';
 };
 
@@ -36553,6 +36719,7 @@ UnspentOutput.prototype.toObject = UnspentOutput.prototype.toJSON = function toO
     address: this.address ? this.address.toString() : undefined,
     txid: this.txId,
     vout: this.outputIndex,
+    token: this.token,
     scriptPubKey: this.script.toBuffer().toString('hex'),
     amount: Unit.fromSatoshis(this.satoshis).toBTC()
   };
