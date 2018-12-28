@@ -34571,6 +34571,7 @@ var BufferWriter = require('../encoding/bufferwriter');
 var Script = require('../script');
 var $ = require('../util/preconditions');
 var errors = require('../errors');
+var Opcode = require('../opcode');
 
 var MAX_SAFE_INTEGER = 0x1fffffffffffff;
 
@@ -34710,6 +34711,9 @@ Output.fromBufferReader = function(br) {
   var size = br.readVarintNum();
   if (size !== 0) {
     obj.script = br.read(size);
+    if (obj.script[0] === Opcode.OP_NDR) {
+      obj.script = script.slice(1);
+    }
   } else {
     obj.script = new buffer.Buffer([]);
   }
@@ -34722,14 +34726,15 @@ Output.prototype.toBufferWriter = function(writer) {
   }
   writer.writeUInt64LEBN(this._satoshisBN);
   var script = this._scriptBuffer;
-  writer.writeVarintNum(script.length);
+  writer.writeVarintNum(script.length+1);
+  writer.writeUInt8(Opcode.OP_NDR);
   writer.write(script);
   return writer;
 };
 
 module.exports = Output;
 
-},{"../crypto/bn":170,"../encoding/bufferwriter":179,"../errors":181,"../script":189,"../util/buffer":207,"../util/js":208,"../util/preconditions":209,"buffer":51,"lodash":246}],200:[function(require,module,exports){
+},{"../crypto/bn":170,"../encoding/bufferwriter":179,"../errors":181,"../opcode":186,"../script":189,"../util/buffer":207,"../util/js":208,"../util/preconditions":209,"buffer":51,"lodash":246}],200:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 
